@@ -16,13 +16,13 @@ import json
 
 class RectifiedFlow(nn.Module):
     '''
-    Desc@: Rectified Flow for Cross-Modal Alignment
+    RFGUME_v1:Version 1 
+    Rectified Flow for Cross-Modal Alignment
     Args:
         dim: dimension of the input and output
         hidden_dim: dimension of the hidden layer
     Returns:
         output: the output of the Rectified Flow
-    Version: v1 
     '''
     def __init__(self, dim, hidden_dim=None):
         super(RectifiedFlow, self).__init__()
@@ -43,18 +43,17 @@ class RectifiedFlow(nn.Module):
     def compute_loss(self, x0, x1):
         batch_size = x0.size(0)
         t = torch.rand(batch_size, 1, device=x0.device)
-        z_t = t * x1 + (1 - t) * x0
+        z_t = t * x1 + (1 - t) * x0 # v = x1 - x0
         v_target = x1 - x0 # 目标传输向量v_target：图像到文本的真实差值（最优传输方向）跨模态语义gap
         v_pred = self.forward(z_t, t) # 模型预测的 t 时刻传输方向
         loss = F.mse_loss(v_pred, v_target)
         return loss
 
+
 class ConditionalRectifiedFlow(nn.Module):
     """
-    Desc@: Conditional Rectified Flow for Cross-Modal and Colabrative ID Singal Alignment
     支持条件输入的 Rectified Flow
     用于: Noise (x0) -> Agent (t=0.5) -> ID (x1), Conditioned on Multimodal Features
-
     """
     def __init__(self, dim, hidden_dim=None):
         super(ConditionalRectifiedFlow, self).__init__()
@@ -107,25 +106,32 @@ class ConditionalRectifiedFlow(nn.Module):
         loss = F.mse_loss(v_pred, v_target)
         return loss
 
-    def generate_agent_modality(self, condition_feat, t_value=0.5):
+    def generate_agent_modality(self, condition_feat, t_value=0.5, steps=1):
         """
         推理阶段：生成 t=t_value 的 Agent Modality
+        支持多步欧拉采样 (Multi-step Euler Sampling)
         """
         batch_size = condition_feat.size(0)
         
-        # 1. 起点：采样高斯噪声
-        z_0 = torch.randn_like(condition_feat)
+        # 1. 起点：采样高斯噪声 (z_0)
+        z = torch.randn_like(condition_feat)
         
-        # 2. 时间：设定为 t=0
-        t_zero = torch.zeros(batch_size, 1, device=condition_feat.device)
+        # 2. 计算步长
+        dt = t_value / steps
         
-        # 3. 预测初始方向
-        v_pred = self.forward(z_0, t_zero, condition_feat)
+        # 3. 逐步迭代
+        for i in range(steps):
+            # 当前时间 t
+            t_current = i * dt
+            t_tensor = torch.full((batch_size, 1), t_current, device=condition_feat.device)
+            
+            # 预测当前位置的速度 v
+            v_pred = self.forward(z, t_tensor, condition_feat)
+            
+            # 更新位置：z_{t+dt} = z_t + v * dt
+            z = z + v_pred * dt
         
-        # 4. 欧拉一步：走到 t=t_value
-        # z_{t} = z_0 + t * v
-        agent_modality = z_0 + t_value * v_pred
-        
+        agent_modality = z
         return agent_modality
 
         
@@ -145,10 +151,13 @@ class GenAlignGUME(GeneralRecommender):
         self.embedding_dim = config['embedding_size']
         self.knn_k = config['knn_k']
         self.n_layers = config['n_layers']
+
         self.rf_weight = config['rf_weight'] if 'rf_weight' in config else 0.1
-        
+        self.t_agent = config['t_agent'] if 't_agent' in config else 0.5
         self.agent_weight = config['agent_weight'] if 'agent_weight' in config else 0.2
         self.agent_loss_weight = config['agent_loss_weight'] if 'agent_loss_weight' in config else 0.1
+        self.agent_step = config['agent_step'] if 'agent_step' in config else 1
+
         self.agent_warmup_epochs = config['agent_warmup_epochs'] if 'agent_warmup_epochs' in config else 0
         self.current_epoch = 0
 
@@ -255,8 +264,8 @@ class GenAlignGUME(GeneralRecommender):
         # 1. Fusion Weight (agent_weight): 保持 Warm-up，避免未训练好的 Agent 干扰主模型推理/特征。
         # 2. Loss Weight (agent_loss_weight): 取消 Warm-up（或快速结束），让 Agent 模块尽早开始充分训练。
         
-        curr_agent_weight = self.agent_weight
-        curr_agent_loss_weight = self.agent_loss_weight
+        curr_agent_weight = self.agent_weight # 0.2
+        curr_agent_loss_weight = self.agent_loss_weight # 0.1
 
         if self.agent_warmup_epochs > 0:
             if self.current_epoch < self.agent_warmup_epochs:
@@ -501,20 +510,31 @@ class GenAlignGUME(GeneralRecommender):
         
         # ===================================================== 
         #  Task B: Agent Modality 对齐 (Generative Alignment) 
-        #  Noise -> ID (Conditioned on Multimodal Content) 
+        #  Noise -> ID (Conditioned on Multimodal Content + User) 
         # ===================================================== 
         # 目标: 让 ID Embedding (Target) 
-        batch_target_id = extended_id_embeds[unique_items].detach() # 建议 detach ID，让 Flow 去追 ID 
+        batch_target_id = extended_id_embeds[pos_items].detach() # 使用 pos_items 而不是 unique，因为我们需要 User 对应关系
         
-        # 条件: 多模态融合特征 (Condition) 
-        # 修正：使用 extended_it_embeds (纯多模态) 而不是 integration_embeds (含 ID)
-        # 避免 Label Leakage
-        batch_condition = extended_it_embeds[unique_items].detach() 
+        # 条件1: 物品多模态特征
+        batch_condition = extended_it_embeds[pos_items].detach()
+        
+        # 条件2: 用户 ID Embedding (个性化引导)
+        # 将用户特征也作为 Condition 拼接到物品特征上
+        batch_user_emb = extended_id_embeds[users].detach()
+        
+        # 融合 Condition: Concat(Item_Content, User_ID)
+        # 注意：这需要修改 RF 模型的输入维度
+        # 在这里我们先做简单的相加或者 Hadamard Product，或者修改模型
+        # 为了不改动模型定义，我们这里尝试相加（假设维度一致）
+        # 或者拼接后经过一个 Linear 层（需要改模型定义）
+        # 考虑到模型定义已固定为 dim，我们采用相加融合: Content + User
+        batch_combined_condition = batch_condition + batch_user_emb
         
         # 获取动态权重计算 Conditional Flow Loss 
-        loss_agent_flow = self.agent_loss_weight * self.rf_agent_model.compute_loss( 
+        _, curr_agent_loss_weight = self.get_dynamic_agent_weights()
+        loss_agent_flow = curr_agent_loss_weight * self.rf_agent_model.compute_loss( 
             target_id=batch_target_id, 
-            condition_feat=batch_condition 
+            condition_feat=batch_combined_condition 
         ) 
         
         return bpr_loss + al_loss + um_loss + reg_loss + loss_intra_flow + loss_agent_flow
@@ -556,31 +576,56 @@ class GenAlignGUME(GeneralRecommender):
         
         # Split into user and item parts
         restore_user_e, restore_item_e = torch.split(all_embeds, [self.n_users, self.n_items], dim=0)
-        integration_users, integration_items = torch.split(integration_embeds, [self.n_users, self.n_items], dim=0)
         
         # 2. 获取多模态条件特征 (Condition)
-        # 修正：Condition 应该只包含多模态信息，而不应该包含 ID 信息。
-        # integration_embeds 是 (Image + Text + ID) / 3 的结果，包含了 ID 信息，这是不对的。
-        # 我们应该使用 coarse_grained_embeds 或者 explicit_image/text 的融合作为 Condition。
-        
-        # 重新计算纯多模态特征
-        explicit_image_embeds, explicit_text_embeds = embeds_3
-        _, explicit_image_item = torch.split(explicit_image_embeds, [self.n_users, self.n_items], dim=0)
-        _, explicit_text_item = torch.split(explicit_text_embeds, [self.n_users, self.n_items], dim=0)
-        
-
+        # Condition 1: Item Multimodal Features
         _, extended_it_items = torch.split(extended_it_embeds, [self.n_users, self.n_items], dim=0)
-        condition_feat = extended_it_items
+        
+        # Condition 2: Target User ID Embedding
+        # user 是一个 Tensor (Batch,)，我们需要取出对应的 User Embedding
+        # 注意：User Embedding 是从 all_embeds (restore_user_e) 中获取的
+        target_user_emb = restore_user_e[user] # (Batch, Dim)
+        
+        # 3. 构造 Personalized Condition
+        # 我们需要为每一个 (User, Item) 对生成 Agent
+        # 但这样计算量太大 (Batch_User * All_Items)。
+        # 妥协方案：
+        #   A. 只在 Rerank 阶段使用 Agent (Top-K) -> 精确但只改变局部顺序
+        #   B. 使用 Average User Embedding 作为 Condition -> 退化为 Non-personalized
+        #   C. (当前采用) 仅在训练时引入 User Condition，推理时仍然只用 Item Condition (Mismatch!)
+        #      或者：推理时，让 user_emb = 0 或者 user_emb = mean_user_emb
+        #      或者：推理时，将 User Embedding 加到 Item Condition 上？
+        #      -> 这在全量预测时不可行，因为每个 Item 针对不同 User 都要变。
+        
+        # 关键决策：
+        # 如果我们在训练时用了 User Condition，推理时必须也用。
+        # 但全量排序要求 Item Embedding 是固定的（或者 User Embedding 固定）。
+        # 如果 Item Embedding 依赖于 User，那就变成了 context-aware recommendation，
+        # 不能简单地用 matmul(U, I.T) 了，复杂度变成 O(N*M)。
+        
+        # 破局：
+        # 我们可以把 Agent Modality 视为一种 "User-Item Interaction" 的预测。
+        # 也就是说，Agent(Item | User) 其实就是一个增强版的 User Representation？
+        # 或者增强版的 Item Representation？
+        
+        # 让我们回退一步：
+        # 如果目的是增强 Item Representation，那么它应该是 User-Agnostic 的。
+        # 如果我们引入 User Condition，那它就是 User-Specific 的。
+        # 在 full_sort_predict 中，我们通常只能做 User-Agnostic 的增强。
+        
+        # 除非：我们只对 User History 中的 Item 做增强？不，那是训练。
+        # 除非：我们在推理时，忽略 User Condition (设为 0 或 Mean)。
+        # 这样模型在训练时学到了个性化，推理时退化为通用模式。
+        # 让我们试试：推理时 condition = item_content + mean_user_emb
+        
+        mean_user_emb = torch.mean(restore_user_e, dim=0, keepdim=True)
+        condition_feat = extended_it_items + mean_user_emb
         
         # 3. 生成 Agent Modality (t=0.5) !!! 核心 !!! 
-        # 输入: 多模态特征作为条件 
-        # 输出: 位于 噪声 和 ID 中间的 Agent 向量 
         with torch.no_grad(): 
-            agent_modality = self.rf_agent_model.generate_agent_modality(condition_feat, t_value=self.t_agent) 
+            agent_modality = self.rf_agent_model.generate_agent_modality(condition_feat, t_value=self.t_agent, steps=self.agent_step) 
         
         # 4. 增强物品表示 
-        # 最终 Item = 原始 GCN Item + α * Agent Modality 
-        # Agent Modality 补全了稀疏 ID 缺失的语义信息，且分布比纯多模态特征更接近协同空间 
         curr_agent_weight, _ = self.get_dynamic_agent_weights()
         final_item_embeddings = restore_item_e + curr_agent_weight * agent_modality 
         

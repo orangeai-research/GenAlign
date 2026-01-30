@@ -5,6 +5,7 @@ Author: OrangeAI Research Team
 Paper: Agent Modality: Generative Multimodal Alignment via Rectified Flow for Recommendation 
 GenAlign: Dual Generative Alignment via Rectified Flow for Multimodal Recommendation
 GenAlign: Generative Alignment via Rectified Flow for Multimodal Recommendation
+Version8: a version of GenAlign with Transformer-based Velocity Network
 '''
 
 import os
@@ -50,71 +51,97 @@ class RectifiedFlow(nn.Module):
         return loss
 
 
-class ConditionalRectifiedFlow(nn.Module):
+class TransformerVelocityNet(nn.Module):
     """
-    Desc@: Conditional Rectified Flow for Cross-Modal and Colabrative ID Singal Alignment
-        Conditioned Rectified Flow for: Noise (x0) -> Agent (t=0.5) -> ID (x1), Conditioned on Multimodal Features
-    Args:
-        dim: dimension of the input and output
-        hidden_dim: dimension of the hidden layer
-    Returns:
-        output: the output of the Conditional Rectified Flow (Agent Modality)
-    Version: v1
+    Desc@: Transformer-based Velocity Network (DiT-like Architecture)
+    Uses Cross-Attention to inject Multimodal Condition
     """
-    def __init__(self, dim, hidden_dim=None):
-        super(ConditionalRectifiedFlow, self).__init__()
-        if hidden_dim is None:
-            hidden_dim = dim * 2 
-            
-        # 1. Time Embedding: 将时间 t 映射到高维特征
+    def __init__(self, dim, num_heads=4, num_layers=2, dropout=0.1):
+        super().__init__()
+        self.dim = dim
+        
+        # Time Embedding MLP
         self.time_mlp = nn.Sequential(
             nn.Linear(1, dim),
             nn.SiLU(),
-            nn.Linear(dim, dim),
-        )
-            
-        # 2. Main Network: ResNet-style block with Time Injection
-        # Input: x(dim) + condition(dim)
-        self.input_proj = nn.Linear(dim * 2, hidden_dim)
-        
-        self.block1 = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Linear(dim, dim)
         )
         
-        self.block2 = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-        )
+        # Input Projection for x (State)
+        self.x_proj = nn.Linear(dim, dim)
         
-        self.output_proj = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(hidden_dim, dim)
-        )
+        # Input Projection for condition (Key/Value)
+        self.c_proj = nn.Linear(dim, dim)
+
+        # Transformer Decoder Layers (Self-Attn + Cross-Attention + FFN)
+        # d_model=dim
+        self.transformer_blocks = nn.ModuleList([
+            nn.TransformerDecoderLayer(
+                d_model=dim, 
+                nhead=num_heads, 
+                dim_feedforward=dim*4, 
+                dropout=dropout, 
+                activation='gelu', # GELU is standard for Transformers
+                batch_first=True,
+                norm_first=True # Pre-Norm is more stable
+            )
+            for _ in range(num_layers)
+        ])
         
-        # Time injection layers (AdaLN-like simple addition)
-        self.time_proj1 = nn.Linear(dim, hidden_dim)
-        self.time_proj2 = nn.Linear(dim, hidden_dim)
+        # Output Projection
+        self.out_proj = nn.Linear(dim, dim)
+        
+        # Initialize weights (DiT style zero-init for last layer often helps)
+        nn.init.zeros_(self.out_proj.weight)
+        nn.init.zeros_(self.out_proj.bias)
 
     def forward(self, x, t, condition):
-        # 1. Process Time
+        """
+        x: (batch, dim) -> Query source
+        t: (batch, 1) -> Time signal
+        condition: (batch, dim) -> Key/Value source
+        """
+        batch_size = x.size(0)
+        
+        # 1. Prepare Query (State + Time)
+        # Project x and t to same dimension
+        x_emb = self.x_proj(x)
         t_emb = self.time_mlp(t)
         
-        # 2. Process Input (x + condition)
-        xc = torch.cat([x, condition], dim=-1)
-        h = self.input_proj(xc)
+        # Add Time Embedding to State (Time Injection)
+        # Treat as a sequence of length 1: (batch, 1, dim)
+        query = (x_emb + t_emb).unsqueeze(1) 
         
-        # 3. Block 1 with Time Injection & Residual
-        h_time1 = self.time_proj1(t_emb)
-        h = h + self.block1(h + h_time1) # Residual connection
+        # 2. Prepare Key/Value (Condition)
+        # Treat as a sequence of length 1: (batch, 1, dim)
+        # If we had multiple modalities (Img, Text), we could concat them here: (batch, 2, dim)
+        kv = self.c_proj(condition).unsqueeze(1)
         
-        # 4. Block 2 with Time Injection & Residual
-        h_time2 = self.time_proj2(t_emb)
-        h = h + self.block2(h + h_time2) # Residual connection
+        # 3. Transformer Forward
+        h = query
+        for block in self.transformer_blocks:
+            # tgt=h (Query), memory=kv (Key/Value)
+            h = block(tgt=h, memory=kv)
+            
+        # 4. Output Projection
+        # Squeeze back to (batch, dim)
+        return self.out_proj(h.squeeze(1))
+
+
+class ConditionalRectifiedFlow(nn.Module):
+    """
+    Desc@: Conditional Rectified Flow with Transformer Backbone (DiT)
+    """
+    def __init__(self, dim, hidden_dim=None):
+        super(ConditionalRectifiedFlow, self).__init__()
         
-        return self.output_proj(h)
+        # 使用 Transformer Backbone
+        # num_heads 和 num_layers 可以作为超参调节
+        # 这里使用轻量级配置: 2 Layers, 4 Heads
+        self.net = TransformerVelocityNet(dim, num_heads=4, num_layers=2)
+
+    def forward(self, x, t, condition):
+        return self.net(x, t, condition)
 
     def compute_loss(self, target_id, condition_feat):
         """

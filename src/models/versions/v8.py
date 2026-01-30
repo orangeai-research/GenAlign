@@ -16,13 +16,13 @@ import json
 
 class RectifiedFlow(nn.Module):
     '''
-    Desc@: Rectified Flow for Cross-Modal Alignment
+    RFGUME_v1:Version 1 
+    Rectified Flow for Cross-Modal Alignment
     Args:
         dim: dimension of the input and output
         hidden_dim: dimension of the hidden layer
     Returns:
         output: the output of the Rectified Flow
-    Version: v1 
     '''
     def __init__(self, dim, hidden_dim=None):
         super(RectifiedFlow, self).__init__()
@@ -43,18 +43,17 @@ class RectifiedFlow(nn.Module):
     def compute_loss(self, x0, x1):
         batch_size = x0.size(0)
         t = torch.rand(batch_size, 1, device=x0.device)
-        z_t = t * x1 + (1 - t) * x0
+        z_t = t * x1 + (1 - t) * x0 # v = x1 - x0
         v_target = x1 - x0 # 目标传输向量v_target：图像到文本的真实差值（最优传输方向）跨模态语义gap
         v_pred = self.forward(z_t, t) # 模型预测的 t 时刻传输方向
         loss = F.mse_loss(v_pred, v_target)
         return loss
 
+
 class ConditionalRectifiedFlow(nn.Module):
     """
-    Desc@: Conditional Rectified Flow for Cross-Modal and Colabrative ID Singal Alignment
     支持条件输入的 Rectified Flow
     用于: Noise (x0) -> Agent (t=0.5) -> ID (x1), Conditioned on Multimodal Features
-
     """
     def __init__(self, dim, hidden_dim=None):
         super(ConditionalRectifiedFlow, self).__init__()
@@ -107,25 +106,32 @@ class ConditionalRectifiedFlow(nn.Module):
         loss = F.mse_loss(v_pred, v_target)
         return loss
 
-    def generate_agent_modality(self, condition_feat, t_value=0.5):
+    def generate_agent_modality(self, condition_feat, t_value=0.5, steps=1):
         """
         推理阶段：生成 t=t_value 的 Agent Modality
+        支持多步欧拉采样 (Multi-step Euler Sampling)
         """
         batch_size = condition_feat.size(0)
         
-        # 1. 起点：采样高斯噪声
-        z_0 = torch.randn_like(condition_feat)
+        # 1. 起点：采样高斯噪声 (z_0)
+        z = torch.randn_like(condition_feat)
         
-        # 2. 时间：设定为 t=0
-        t_zero = torch.zeros(batch_size, 1, device=condition_feat.device)
+        # 2. 计算步长
+        dt = t_value / steps
         
-        # 3. 预测初始方向
-        v_pred = self.forward(z_0, t_zero, condition_feat)
+        # 3. 逐步迭代
+        for i in range(steps):
+            # 当前时间 t
+            t_current = i * dt
+            t_tensor = torch.full((batch_size, 1), t_current, device=condition_feat.device)
+            
+            # 预测当前位置的速度 v
+            v_pred = self.forward(z, t_tensor, condition_feat)
+            
+            # 更新位置：z_{t+dt} = z_t + v * dt
+            z = z + v_pred * dt
         
-        # 4. 欧拉一步：走到 t=t_value
-        # z_{t} = z_0 + t * v
-        agent_modality = z_0 + t_value * v_pred
-        
+        agent_modality = z
         return agent_modality
 
         
@@ -145,10 +151,13 @@ class GenAlignGUME(GeneralRecommender):
         self.embedding_dim = config['embedding_size']
         self.knn_k = config['knn_k']
         self.n_layers = config['n_layers']
+
         self.rf_weight = config['rf_weight'] if 'rf_weight' in config else 0.1
-        
+        self.t_agent = config['t_agent'] if 't_agent' in config else 0.5
         self.agent_weight = config['agent_weight'] if 'agent_weight' in config else 0.2
         self.agent_loss_weight = config['agent_loss_weight'] if 'agent_loss_weight' in config else 0.1
+        self.agent_step = config['agent_step'] if 'agent_step' in config else 1
+
         self.agent_warmup_epochs = config['agent_warmup_epochs'] if 'agent_warmup_epochs' in config else 0
         self.current_epoch = 0
 
@@ -255,8 +264,8 @@ class GenAlignGUME(GeneralRecommender):
         # 1. Fusion Weight (agent_weight): 保持 Warm-up，避免未训练好的 Agent 干扰主模型推理/特征。
         # 2. Loss Weight (agent_loss_weight): 取消 Warm-up（或快速结束），让 Agent 模块尽早开始充分训练。
         
-        curr_agent_weight = self.agent_weight
-        curr_agent_loss_weight = self.agent_loss_weight
+        curr_agent_weight = self.agent_weight # 0.2
+        curr_agent_loss_weight = self.agent_loss_weight # 0.1
 
         if self.agent_warmup_epochs > 0:
             if self.current_epoch < self.agent_warmup_epochs:
@@ -512,7 +521,8 @@ class GenAlignGUME(GeneralRecommender):
         batch_condition = extended_it_embeds[unique_items].detach() 
         
         # 获取动态权重计算 Conditional Flow Loss 
-        loss_agent_flow = self.agent_loss_weight * self.rf_agent_model.compute_loss( 
+        _, curr_agent_loss_weight = self.get_dynamic_agent_weights()
+        loss_agent_flow = curr_agent_loss_weight * self.rf_agent_model.compute_loss( 
             target_id=batch_target_id, 
             condition_feat=batch_condition 
         ) 
@@ -576,7 +586,7 @@ class GenAlignGUME(GeneralRecommender):
         # 输入: 多模态特征作为条件 
         # 输出: 位于 噪声 和 ID 中间的 Agent 向量 
         with torch.no_grad(): 
-            agent_modality = self.rf_agent_model.generate_agent_modality(condition_feat, t_value=self.t_agent) 
+            agent_modality = self.rf_agent_model.generate_agent_modality(condition_feat, t_value=self.t_agent, steps=self.agent_step) 
         
         # 4. 增强物品表示 
         # 最终 Item = 原始 GCN Item + α * Agent Modality 

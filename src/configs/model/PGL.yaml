@@ -1,4 +1,3 @@
-# 直接运行即可，PGL 在所有数据集上配置文件一致无需修改
 embedding_size: 64
 feat_embed_dim: 64
 weight_size: [64, 64]

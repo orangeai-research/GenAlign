@@ -3,8 +3,7 @@ Desc@: Official Implementation of GenAlign (KDD2026)
 Time: 2026-01-28
 Author: OrangeAI Research Team
 Paper: Agent Modality: Generative Multimodal Alignment via Rectified Flow for Recommendation 
-GenAlign: Dual Generative Alignment via Rectified Flow for Multimodal Recommendation
-GenAlign: Generative Alignment via Rectified Flow for Multimodal Recommendation
+Version4: 引入了 Hybrid Loss (MSE + 0.5 * Cosine)
 '''
 
 import os
@@ -131,49 +130,29 @@ class ConditionalRectifiedFlow(nn.Module):
         # 2. 定义终点 x1: 真实的协同 ID
         x1 = target_id
         
-        # [Math Optimization] Mini-Batch Optimal Transport
-        # 在 Batch 内重新配对 x0 和 x1，使得传输距离最小，路径更直
-        # 简单的贪心策略：按 Norm 排序近似 OT
-        # 或者直接计算 Pairwise Distance 矩阵然后求解（计算量大）
-        # 这里使用一种简单有效的近似：Sorting
-        # 对 x0 和 x1 分别按第一主成分投影排序，或者简单按 Norm 排序
-        # 考虑到推荐系统 Embedding 的特性，我们不做复杂的 OT，
-        # 而是保留随机配对，因为推荐系统中的 User/Item 对是固定的（Condition 是固定的）
-        # 注意：这里是 Conditional Flow Matching，x1 (ID) 和 condition 是绑定的！
-        # 我们不能打乱 x1 和 condition 的对应关系！
-        # 唯一能动的是 x0 (噪声)。
-        # 所以 OT 的含义是：对于给定的 (x1, c)，选择一个最优的 x0。
-        # 理论上 x0 ~ N(0, I)，我们可以选择离 x1 最近的 x0 吗？
-        # 不行，因为推理时我们无法预知哪个 x0 离目标近。
-        # 所以对于 Conditional Flow，通常不做 OT 配对，除非是无条件生成。
-        # 
-        # 因此，这里的数学优化我们采用：**Logit-Normal Sampling for t**
-        # 使得训练集中在中间区域（更难学的区域），而不是均匀分布
+        # 3. 采样时间 t
+        t = torch.rand(batch_size, 1, device=x0.device)
         
-        # 3. 采样时间 t (Logit-Normal Sampling)
-        # t = sigmoid(sigma * z + mu), z ~ N(0, 1)
-        # 这种采样方式让 t 更集中在 0.5 附近，避免边缘 0 和 1 的无效训练
-        mu, sigma = 0.0, 1.0
-        t_noise = torch.randn(batch_size, 1, device=x0.device)
-        t = torch.sigmoid(mu + sigma * t_noise)
         # 4. 构造插值路径 (Interpolation)
         z_t = t * x1 + (1 - t) * x0
+        
         # 5. 计算目标速度 (Target Velocity)
         v_target = x1 - x0
+        
         # 6. 模型预测速度 (Predicted Velocity)
         v_pred = self.forward(z_t, t, condition_feat)
-        # 7. MSE Loss
+        
+        # 7. Hybrid Loss: MSE + Cosine
+        # MSE 关注数值逼近
         mse_loss = F.mse_loss(v_pred, v_target)
         
-        # [Math Optimization] Velocity Consistency Regularization
-        # 鼓励预测速度的模长（Magnitude）与目标速度的模长一致
-        # 这有助于稳定训练，防止生成向量发散
-        v_pred_norm = torch.norm(v_pred, dim=-1)
-        v_target_norm = torch.norm(v_target, dim=-1)
-        norm_loss = F.mse_loss(v_pred_norm, v_target_norm)
+        # Cosine 关注方向一致性 (推荐系统核心)
+        # maximizing cosine similarity <-> minimizing 1 - cosine
+        cosine_loss = 1.0 - F.cosine_similarity(v_pred, v_target, dim=-1).mean()
         
-        # Total Loss
-        loss = mse_loss + 0.1 * norm_loss
+        # 综合 Loss (Cosine 权重设为 0.1 作为辅助，或者 1.0)
+        # 经验上，方向对齐对 Ranking 指标 (Recall/NDCG) 帮助很大
+        loss = mse_loss + 0.5 * cosine_loss
         
         return loss
 

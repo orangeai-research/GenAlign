@@ -2,7 +2,7 @@
 gpu_id: 1
 use_gpu: True
 seed: [999]
-
+# seed: [42, 111, 222, 333, 444, 555, 666, 777, 888, 2025, 2026, 2027, 2028, 0, 1, 2, 3, 4, 5, 6, 28]
 # multi-modal raw features
 data_path: '../data/'
 inter_splitting_label: 'x_label'
